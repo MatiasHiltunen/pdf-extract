@@ -37,8 +37,8 @@ fn main() {
     };
 
     if doc.is_encrypted() {
-        doc.decrypt("");
+        doc.decrypt("").unwrap();
     }
 
-    output_doc(&doc, output.as_mut());
+    output_doc(&doc, output.as_mut()).unwrap();
 }

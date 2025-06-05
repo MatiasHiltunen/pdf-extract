@@ -64,7 +64,9 @@ impl ExpectedText<'_> {
                 let url = std::fs::read_to_string(format!("tests/docs/{}", filename)).unwrap();
                 let resp = ureq::get(&url).call().unwrap();
                 let mut file = std::fs::File::create(&file_path).unwrap();
-                std::io::copy(&mut resp.into_reader(), &mut file).unwrap();
+                let (_parts, body) = resp.into_parts();
+                let mut reader = body.into_reader();
+                std::io::copy(&mut reader, &mut file).unwrap();
                 file_path
             }
         } else {
