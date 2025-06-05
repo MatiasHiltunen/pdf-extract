@@ -6,20 +6,17 @@ use log::{debug, warn, error};
 use lopdf::{
     content::Content,
     encryption::DecryptionError,
-    Document, Dictionary, Object, ObjectId, Stream,
 };
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    fmt::{self, Debug, Write as FmtWrite},
-    io::Write as IoWrite,
-    fs::File,
+    collections::HashMap,
+    fmt::{self, Debug},
     marker::PhantomData,
     sync::Arc,
     slice::Iter,
     str,
 };
 use thiserror::Error;
-use unicode_normalization::UnicodeNormalization;
+use cff_parser::Table;
 
 // Re-export lopdf for backward compatibility
 pub use lopdf::*;
@@ -186,7 +183,7 @@ pub mod document_utils {
             .map_err(|_| PdfError::MissingField("Root".to_string()))
             .and_then(|obj| match obj {
                 Object::Reference(id) => doc.get_object(*id)
-                    .map_err(|e| PdfError::Parse(e)),
+                    .map_err(PdfError::Parse),
                 _ => Err(PdfError::InvalidStructure("Root must be a reference".to_string())),
             })
             .and_then(|obj| match obj {
@@ -202,7 +199,7 @@ pub mod document_utils {
             .map_err(|_| PdfError::MissingField("Pages".to_string()))
             .and_then(|obj| match obj {
                 Object::Reference(id) => doc.get_object(*id)
-                    .map_err(|e| PdfError::Parse(e)),
+                    .map_err(PdfError::Parse),
                 _ => Err(PdfError::InvalidStructure("Pages must be a reference".to_string())),
             })
             .and_then(|obj| match obj {
@@ -220,7 +217,7 @@ pub mod object_utils {
     pub fn maybe_deref<'a>(doc: &'a Document, obj: &'a Object) -> PdfResult<&'a Object> {
         match obj {
             Object::Reference(r) => doc.get_object(*r)
-                .map_err(|e| PdfError::Parse(e)),
+                .map_err(PdfError::Parse),
             _ => Ok(obj),
         }
     }
@@ -349,7 +346,7 @@ fn get_name_string(doc: &Document, dict: &Dictionary, key: &[u8]) -> PdfResult<S
         .and_then(|o| object_utils::maybe_deref(doc, o))
         .and_then(|o| o.as_name()
             .map_err(|_| PdfError::InvalidStructure("Expected name".to_string())))
-        .and_then(|n| string_utils::pdf_to_utf8(n))
+        .and_then(string_utils::pdf_to_utf8)
 }
 
 fn maybe_get_name_string(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<String> {
@@ -425,11 +422,45 @@ impl PdfSimpleFont {
         debug!("Creating {} font: {}", subtype, base_name);
         
         let encoding = Self::load_encoding(doc, font, &base_name)?;
-        let unicode_map = Self::load_unicode_map(doc, font)?;
+        // --- Begin: CFF/Type1C unicode map extraction ---
+        let mut unicode_map = None;
+        let descriptor: Option<&Dictionary> = get(doc, font, b"FontDescriptor")?;
+        if let Some(desc) = descriptor {
+            if let Some(Object::Stream(s)) = get::<Option<&Object>>(doc, desc, b"FontFile3")? {
+                let subtype = get_name_string(doc, &s.dict, b"Subtype")?;
+                if subtype == "Type1C" {
+                    let contents = get_contents(s);
+                    if let Some(cff) = Table::parse(&contents) {
+                        let mut mapping = std::collections::HashMap::new();
+                        let charset_table = cff.charset.get_table();
+                        let encoding_table = cff.encoding.get_table();
+                        for (i, (&cid, &sid)) in encoding_table.iter().zip(charset_table.iter()).enumerate() {
+                            if let Some(name) = cff_parser::string_by_id(&cff, sid) {
+                                let unicode = glyphnames::name_to_unicode(&name)
+                                    .or_else(|| zapfglyphnames::zapfdigbats_names_to_unicode(&name));
+                                if let Some(unicode) = unicode {
+                                    if let Ok(s) = String::from_utf16(&[unicode]) {
+                                        mapping.insert(cid as u32, s);
+                                    }
+                                }
+                            }
+                        }
+                        // Merge with ToUnicode map if present
+                        if let Some(mut to_unicode) = get_unicode_map(doc, font)? {
+                            mapping.extend(to_unicode);
+                        }
+                        unicode_map = Some(mapping);
+                    }
+                }
+            }
+        }
+        // --- End: CFF/Type1C unicode map extraction ---
+        // If not set above, fallback to ToUnicode map
+        let unicode_map = unicode_map.or_else(|| Self::load_unicode_map(doc, font).unwrap_or(None));
         let (widths, missing_width) = Self::load_widths(doc, font, &base_name, encoding.as_ref())?;
         
         Ok(Self {
-            base_name,
+            base_name: base_name,
             encoding,
             unicode_map,
             widths,
@@ -437,7 +468,7 @@ impl PdfSimpleFont {
         })
     }
     
-    fn load_encoding(doc: &Document, font: &Dictionary, base_name: &str) -> PdfResult<Option<Vec<u16>>> {
+    fn load_encoding(doc: &Document, font: &Dictionary, _base_name: &str) -> PdfResult<Option<Vec<u16>>> {
         let encoding_obj: Option<&Object> = get(doc, font, b"Encoding")?;
         
         match encoding_obj {
@@ -531,9 +562,10 @@ impl PdfSimpleFont {
                     let subtype = get_name_string(doc, &s.dict, b"Subtype")?;
                     if subtype == "Type1C" {
                         let contents = get_contents(s);
-                        if let Some(_table) = cff_parser::Table::parse(&contents) {
-                            // Handle CFF encoding
-                            // This is simplified - real implementation would be more complex
+                        if let Some(_cff) = Table::parse(&contents) {
+                            // You can now use `_cff` to extract encoding/charset as needed
+                            // For now, just return None as before, as this function returns Vec<u16>
+                            // and CFF encoding is handled in PdfSimpleFont::new
                             return Ok(None);
                         }
                     }
@@ -558,7 +590,7 @@ impl PdfSimpleFont {
         let missing_width = get::<Option<f64>>(doc, font, b"MissingWidth")?.unwrap_or(0.0);
         
         // Try to load widths from font dictionary
-        if let (Some(first_char), Some(last_char), Some(widths)) = (
+        if let (Some(first_char), Some(_last_char), Some(widths)) = (
             maybe_get::<i64>(doc, font, b"FirstChar"),
             maybe_get::<i64>(doc, font, b"LastChar"),
             maybe_get::<Vec<f64>>(doc, font, b"Widths"),
@@ -588,14 +620,14 @@ impl PdfSimpleFont {
                         let c = glyphnames::name_to_unicode(w.2).unwrap_or(0);
                         for (i, &enc_char) in encoding.iter().enumerate() {
                             if enc_char == c {
-                                width_map.insert(i as CharCode, w.1 as f64);
+                                width_map.insert(i as CharCode, w.1);
                             }
                         }
                     }
                 } else {
                     for w in font_metrics.2 {
                         if w.0 >= 0 {
-                            width_map.insert(w.0 as CharCode, w.1 as f64);
+                            width_map.insert(w.0 as CharCode, w.1);
                         }
                     }
                 }
@@ -947,7 +979,7 @@ fn encoding_to_unicode_table(name: &[u8]) -> PdfResult<Vec<u16>> {
     };
     
     Ok(encoding.iter()
-        .map(|&opt| opt.and_then(|name| glyphnames::name_to_unicode(name)).unwrap_or(0))
+        .map(|&opt| opt.and_then(glyphnames::name_to_unicode).unwrap_or(0))
         .collect())
 }
 
@@ -1003,46 +1035,9 @@ mod type1_encoding_parser {
     use std::collections::HashMap;
     
     pub fn get_encoding_map(data: &[u8]) -> Result<HashMap<i64, Vec<u8>>, &'static str> {
+        let _ = data;
         // Simplified implementation - in real code this would parse Type1 font encoding
         Ok(HashMap::new())
-    }
-}
-
-// Add missing cff_parser module  
-mod cff_parser {
-    pub struct Table<'a> {
-        pub charset: Charset,
-        pub encoding: Encoding,
-        _data: &'a [u8],
-    }
-    
-    pub struct Charset;
-    pub struct Encoding;
-    
-    impl Charset {
-        pub fn get_table(&self) -> Vec<u16> {
-            Vec::new()
-        }
-    }
-    
-    impl Encoding {
-        pub fn get_table(&self) -> Vec<u16> {
-            Vec::new()
-        }
-    }
-    
-    impl<'a> Table<'a> {
-        pub fn parse(data: &'a [u8]) -> Option<Table<'a>> {
-            Some(Table {
-                charset: Charset,
-                encoding: Encoding,
-                _data: data,
-            })
-        }
-    }
-    
-    pub fn string_by_id(_table: &Table, _id: u16) -> Option<String> {
-        None
     }
 }
 
@@ -1286,11 +1281,11 @@ impl<W: std::io::Write> OutputDev for PlainTextOutput<W> {
         
         if self.first_char {
             if (y - self.last_y).abs() > transformed_font_size * 1.5 {
-                write!(self.writer, "\n")?;
+                writeln!(self.writer)?;
             }
             
             if x < self.last_end && (y - self.last_y).abs() > transformed_font_size * 0.5 {
-                write!(self.writer, "\n")?;
+                writeln!(self.writer)?;
             }
             
             if x > self.last_end + transformed_font_size * 0.1 {
@@ -1343,7 +1338,7 @@ impl<W: std::io::Write> HTMLOutput<W> {
             let transformed_font_size = (transformed_font_size_vec.x * transformed_font_size_vec.y).sqrt();
             let (x, y) = (position.m31, position.m32);
             
-            write!(self.file, "<div style='position: absolute; left: {}px; top: {}px; font-size: {}px'>{}</div>\n",
+            writeln!(self.file, "<div style='position: absolute; left: {}px; top: {}px; font-size: {}px'>{}</div>",
                    x, y, transformed_font_size, insert_nbsp(&self.buf))?;
             self.buf.clear();
         }
@@ -1422,7 +1417,7 @@ impl<W: std::io::Write> SVGOutput<W> {
 impl<W: std::io::Write> OutputDev for SVGOutput<W> {
     fn begin_page(&mut self, _page_num: u32, media_box: &MediaBox, art_box: Option<(f64, f64, f64, f64)>) -> PdfResult<()> {
         let ver = 1.1;
-        write!(self.file, "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n")?;
+        writeln!(self.file, "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>")?;
         write!(self.file, r#"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">"#)?;
         
         if let Some(art_box) = art_box {
@@ -1437,16 +1432,16 @@ impl<W: std::io::Write> OutputDev for SVGOutput<W> {
             write!(self.file, "<svg width=\"{}\" height=\"{}\" xmlns=\"http://www.w3.org/2000/svg\" version=\"{}\" viewBox='{} {} {} {}'>",
                    width, height, ver, media_box.llx, media_box.lly, width, height)?;
         }
-        write!(self.file, "\n")?;
+        writeln!(self.file)?;
         
         let ctm: PdfTransform = Transform2D::scale(1., -1.).then_translate(vec2(0., media_box.ury));
-        write!(self.file, "<g transform='matrix({}, {}, {}, {}, {}, {})'>\n",
+        writeln!(self.file, "<g transform='matrix({}, {}, {}, {}, {}, {})'>",
                ctm.m11, ctm.m12, ctm.m21, ctm.m22, ctm.m31, ctm.m32)?;
         Ok(())
     }
     
     fn end_page(&mut self) -> PdfResult<()> {
-        write!(self.file, "</g>\n")?;
+        writeln!(self.file, "</g>")?;
         write!(self.file, "</svg>")?;
         Ok(())
     }
@@ -1481,7 +1476,7 @@ impl<W: std::io::Write> OutputDev for SVGOutput<W> {
         }
         
         write!(self.file, "<path d='{}' />", d.join(" "))?;
-        write!(self.file, "</g>\n")?;
+        writeln!(self.file, "</g>")?;
         Ok(())
     }
 }
@@ -1626,12 +1621,9 @@ pub fn print_metadata(doc: &Document) {
     debug!("Version: {}", doc.version);
     if let Some(info) = document_utils::get_info(doc) {
         for (k, v) in info {
-            match v {
-                Object::String(s, StringFormat::Literal) => {
-                    debug!("{}: {}", string_utils::pdf_to_utf8(k).unwrap_or_default(), 
-                           string_utils::pdf_to_utf8(s).unwrap_or_default());
-                }
-                _ => {}
+            if let Object::String(s, StringFormat::Literal) = v {
+                debug!("{}: {}", string_utils::pdf_to_utf8(k).unwrap_or_default(), 
+                       string_utils::pdf_to_utf8(s).unwrap_or_default());
             }
         }
     }
@@ -1832,7 +1824,7 @@ impl<'a> Processor<'a> {
                     gs.stroke_color = match gs.stroke_colorspace {
                         ColorSpace::Pattern => Vec::new(),
                         _ => operation.operands.iter()
-                            .map(|x| object_utils::as_num(x))
+                            .map(object_utils::as_num)
                             .collect::<PdfResult<Vec<_>>>()?,
                     };
                 }
@@ -1840,7 +1832,7 @@ impl<'a> Processor<'a> {
                     gs.fill_color = match gs.fill_colorspace {
                         ColorSpace::Pattern => Vec::new(),
                         _ => operation.operands.iter()
-                            .map(|x| object_utils::as_num(x))
+                            .map(object_utils::as_num)
                             .collect::<PdfResult<Vec<_>>>()?,
                     };
                 }
