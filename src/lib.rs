@@ -349,12 +349,6 @@ fn get_name_string(doc: &Document, dict: &Dictionary, key: &[u8]) -> PdfResult<S
         .and_then(string_utils::pdf_to_utf8)
 }
 
-fn maybe_get_name_string(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<String> {
-    object_utils::maybe_get_obj(doc, dict, key)
-        .and_then(|n| n.as_name().ok())
-        .and_then(|n| string_utils::pdf_to_utf8(n).ok())
-}
-
 fn maybe_get_name<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> Option<&'a [u8]> {
     object_utils::maybe_get_obj(doc, dict, key)
         .and_then(|n| n.as_name().ok())
@@ -434,7 +428,7 @@ impl PdfSimpleFont {
                         let mut mapping = std::collections::HashMap::new();
                         let charset_table = cff.charset.get_table();
                         let encoding_table = cff.encoding.get_table();
-                        for (i, (&cid, &sid)) in encoding_table.iter().zip(charset_table.iter()).enumerate() {
+                        for (_i, (&cid, &sid)) in encoding_table.iter().zip(charset_table.iter()).enumerate() {
                             if let Some(name) = cff_parser::string_by_id(&cff, sid) {
                                 let unicode = glyphnames::name_to_unicode(&name)
                                     .or_else(|| zapfglyphnames::zapfdigbats_names_to_unicode(&name));
@@ -446,7 +440,7 @@ impl PdfSimpleFont {
                             }
                         }
                         // Merge with ToUnicode map if present
-                        if let Some(mut to_unicode) = get_unicode_map(doc, font)? {
+                        if let Some(to_unicode) = get_unicode_map(doc, font)? {
                             mapping.extend(to_unicode);
                         }
                         unicode_map = Some(mapping);
@@ -1095,24 +1089,24 @@ impl Path {
 // Color space types
 #[derive(Clone, Debug)]
 pub struct CalGray {
-    white_point: [f64; 3],
-    black_point: Option<[f64; 3]>,
-    gamma: Option<f64>,
+    _white_point: [f64; 3],
+    _black_point: Option<[f64; 3]>,
+    _gamma: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CalRGB {
-    white_point: [f64; 3],
-    black_point: Option<[f64; 3]>,
-    gamma: Option<[f64; 3]>,
-    matrix: Option<Vec<f64>>,
+    _white_point: [f64; 3],
+    _black_point: Option<[f64; 3]>,
+    _gamma: Option<[f64; 3]>,
+    _matrix: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Lab {
-    white_point: [f64; 3],
-    black_point: Option<[f64; 3]>,
-    range: Option<[f64; 4]>,
+    _white_point: [f64; 3],
+    _black_point: Option<[f64; 3]>,
+    _range: Option<[f64; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -1128,9 +1122,9 @@ pub enum AlternateColorSpace {
 
 #[derive(Clone)]
 pub struct Separation {
-    name: String,
-    alternate_space: AlternateColorSpace,
-    tint_transform: Box<Function>,
+    _name: String,
+    _alternate_space: AlternateColorSpace,
+    _tint_transform: Box<Function>,
 }
 
 #[derive(Clone)]
@@ -1149,29 +1143,11 @@ pub enum ColorSpace {
 
 // Function types
 #[derive(Clone, Debug)]
-struct Type0Func {
-    domain: Vec<f64>,
-    range: Vec<f64>,
-    contents: Vec<u8>,
-    size: Vec<i64>,
-    bits_per_sample: i64,
-    encode: Vec<f64>,
-    decode: Vec<f64>,
-}
-
-#[derive(Clone, Debug)]
-struct Type2Func {
-    c0: Option<Vec<f64>>,
-    c1: Option<Vec<f64>>,
-    n: f64,
-}
-
-#[derive(Clone, Debug)]
 enum Function {
-    Type0(Type0Func),
-    Type2(Type2Func),
+    Type0(()),
+    Type2(()),
     Type3,
-    Type4(Vec<u8>),
+    Type4(()),
 }
 
 impl Function {
@@ -1190,52 +1166,47 @@ impl Function {
                     Object::Stream(stream) => stream,
                     _ => return Err(PdfError::InvalidStructure("Type 0 function must be stream".to_string())),
                 };
-                let range: Vec<f64> = get(doc, dict, b"Range")?;
-                let domain: Vec<f64> = get(doc, dict, b"Domain")?;
-                let contents = get_contents(stream);
-                let size: Vec<i64> = get(doc, dict, b"Size")?;
-                let bits_per_sample = get(doc, dict, b"BitsPerSample")?;
+                let _range: Vec<f64> = get(doc, dict, b"Range")?;
+                let _domain: Vec<f64> = get(doc, dict, b"Domain")?;
+                let _contents = get_contents(stream);
+                let _size: Vec<i64> = get(doc, dict, b"Size")?;
+                let _bits_per_sample: i64 = get(doc, dict, b"BitsPerSample")?;
+
+                // Attempt to re-introduce _encode parsing
+                let encode_obj: Option<Vec<f64>> = get(doc, dict, b"Encode")?;
+                let _encode: Vec<f64> = encode_obj.unwrap_or_else(|| {
+                    let mut default = Vec::new();
+                    for i_val in &_size {
+                        default.push(0.);
+                        default.push((*i_val - 1) as f64);
+                    }
+                    default
+                });
                 
-                let encode = get::<Option<Vec<f64>>>(doc, dict, b"Encode")?
-                    .unwrap_or_else(|| {
-                        let mut default = Vec::new();
-                        for i in &size {
-                            default.push(0.);
-                            default.push((i - 1) as f64);
-                        }
-                        default
-                    });
-                
-                let decode = get::<Option<Vec<f64>>>(doc, dict, b"Decode")?
-                    .unwrap_or_else(|| range.clone());
-                
-                Ok(Function::Type0(Type0Func {
-                    domain,
-                    range,
-                    size,
-                    contents,
-                    bits_per_sample,
-                    encode,
-                    decode,
-                }))
+                /* // _decode still commented out
+                let _decode = get::<Option<Vec<f64>>>(doc, dict, b"Decode")?
+                    .unwrap_or_else(|| _range.clone());
+                */
+
+                Ok(Function::Type0(()))
             }
             2 => {
-                let c0 = get::<Option<Vec<f64>>>(doc, dict, b"C0")?;
-                let c1 = get::<Option<Vec<f64>>>(doc, dict, b"C1")?;
-                let n = get::<f64>(doc, dict, b"N")?;
-                Ok(Function::Type2(Type2Func { c0, c1, n }))
+                let _c0 = get::<Option<Vec<f64>>>(doc, dict, b"C0")?;
+                let _c1 = get::<Option<Vec<f64>>>(doc, dict, b"C1")?;
+                let _n = get::<f64>(doc, dict, b"N")?;
+                Ok(Function::Type2(())) // Correctly pass unit type
             }
             3 => Ok(Function::Type3),
             4 => {
-                let contents = match obj {
+                let _contents = match obj { // _contents is now unused due to Type4(()) but needs to be processed for warnings/errors
                     Object::Stream(stream) => {
                         let contents = get_contents(stream);
                         warn!("Unhandled type-4 function");
-                        contents
+                        contents // This value is not used for Type4(()), but keep logic for potential errors/warnings
                     }
                     _ => return Err(PdfError::InvalidStructure("Type 4 function must be stream".to_string())),
                 };
-                Ok(Function::Type4(contents))
+                Ok(Function::Type4(())) // Correctly pass unit type
             }
             _ => Err(PdfError::InvalidStructure(format!("Unknown function type {}", function_type))),
         }
@@ -2179,28 +2150,28 @@ fn make_colorspace(doc: &Document, name: &[u8], resources: &Dictionary) -> Color
                                         let dict = cs[1].as_dict()
                                             .expect("CalGray must have dict");
                                         AlternateColorSpace::CalGray(CalGray {
-                                            white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
-                                            black_point: get(doc, dict, b"BlackPoint").ok(),
-                                            gamma: get(doc, dict, b"Gamma").ok(),
+                                            _white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
+                                            _black_point: get(doc, dict, b"BlackPoint").ok(),
+                                            _gamma: get(doc, dict, b"Gamma").ok(),
                                         })
                                     }
                                     "CalRGB" => {
                                         let dict = cs[1].as_dict()
                                             .expect("CalRGB must have dict");
                                         AlternateColorSpace::CalRGB(CalRGB {
-                                            white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
-                                            black_point: get(doc, dict, b"BlackPoint").ok(),
-                                            gamma: get(doc, dict, b"Gamma").ok(),
-                                            matrix: get(doc, dict, b"Matrix").ok(),
+                                            _white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
+                                            _black_point: get(doc, dict, b"BlackPoint").ok(),
+                                            _gamma: get(doc, dict, b"Gamma").ok(),
+                                            _matrix: get(doc, dict, b"Matrix").ok(),
                                         })
                                     }
                                     "Lab" => {
                                         let dict = cs[1].as_dict()
                                             .expect("Lab must have dict");
                                         AlternateColorSpace::Lab(Lab {
-                                            white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
-                                            black_point: get(doc, dict, b"BlackPoint").ok(),
-                                            range: get(doc, dict, b"Range").ok(),
+                                            _white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
+                                            _black_point: get(doc, dict, b"BlackPoint").ok(),
+                                            _range: get(doc, dict, b"Range").ok(),
                                         })
                                     }
                                     _ => panic!("Unknown alternate colorspace"),
@@ -2209,12 +2180,12 @@ fn make_colorspace(doc: &Document, name: &[u8], resources: &Dictionary) -> Color
                             _ => panic!("Alternate space must be name or array"),
                         };
                         
-                        let tint_transform = Box::new(Function::new(doc, object_utils::maybe_deref(doc, &cs[3]).expect("deref")).expect("Function"));
+                        let _tint_transform = Box::new(Function::new(doc, object_utils::maybe_deref(doc, &cs[3]).expect("deref")).expect("Function"));
                         
                         ColorSpace::Separation(Separation {
-                            name,
-                            alternate_space,
-                            tint_transform,
+                            _name: name,
+                            _alternate_space: alternate_space,
+                            _tint_transform,
                         })
                     }
                     "ICCBased" => {
@@ -2227,28 +2198,28 @@ fn make_colorspace(doc: &Document, name: &[u8], resources: &Dictionary) -> Color
                         let dict = cs[1].as_dict()
                             .expect("CalGray must have dict");
                         ColorSpace::CalGray(CalGray {
-                            white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
-                            black_point: get(doc, dict, b"BlackPoint").ok(),
-                            gamma: get(doc, dict, b"Gamma").ok(),
+                            _white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
+                            _black_point: get(doc, dict, b"BlackPoint").ok(),
+                            _gamma: get(doc, dict, b"Gamma").ok(),
                         })
                     }
                     "CalRGB" => {
                         let dict = cs[1].as_dict()
                             .expect("CalRGB must have dict");
                         ColorSpace::CalRGB(CalRGB {
-                            white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
-                            black_point: get(doc, dict, b"BlackPoint").ok(),
-                            gamma: get(doc, dict, b"Gamma").ok(),
-                            matrix: get(doc, dict, b"Matrix").ok(),
+                            _white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
+                            _black_point: get(doc, dict, b"BlackPoint").ok(),
+                            _gamma: get(doc, dict, b"Gamma").ok(),
+                            _matrix: get(doc, dict, b"Matrix").ok(),
                         })
                     }
                     "Lab" => {
                         let dict = cs[1].as_dict()
                             .expect("Lab must have dict");
                         ColorSpace::Lab(Lab {
-                            white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
-                            black_point: get(doc, dict, b"BlackPoint").ok(),
-                            range: get(doc, dict, b"Range").ok(),
+                            _white_point: get(doc, dict, b"WhitePoint").expect("WhitePoint"),
+                            _black_point: get(doc, dict, b"BlackPoint").ok(),
+                            _range: get(doc, dict, b"Range").ok(),
                         })
                     }
                     "Pattern" => ColorSpace::Pattern,
